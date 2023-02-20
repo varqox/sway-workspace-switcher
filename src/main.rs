@@ -690,7 +690,9 @@ async fn handle_commands<T: tokio_stream::Stream<Item = String> + Unpin>(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     // Holding pipe writer open prevents reading EOF if an external pipe writer closes file descriptor
     // (Linux pipe semantics is that if the last writer closes, the readers receive a read error,
