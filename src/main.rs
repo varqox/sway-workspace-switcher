@@ -1,4 +1,7 @@
+/// Server program that abstracts sway workspaces into layers of 2D grids and navigates through them
+
 use serde_json::Value;
+use std::os::unix::fs::FileTypeExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
@@ -498,8 +501,6 @@ mod state {
             }
         }
 
-        // TODO: do not remove the pipe because of losing the pending commands upon restart???
-
         async fn impl_switch_carry_workspace(&mut self, carry: bool, kind: SwitchKind) {
             let old_workspace = {
                 let Some(workspace_id) = self.focused else {
@@ -596,16 +597,29 @@ async fn create_command_pipe() -> std::io::Result<(tokio::fs::File, tokio::fs::F
         pipe_path.file_name().unwrap().to_str().unwrap()
     ));
     let pipe_path = pipe_path;
-
     tracing::info!("Command pipe path: {:?}", pipe_path);
-    match std::fs::remove_file(&pipe_path) {
-        Ok(()) => (),
-        Err(e) => match e.kind() {
-            std::io::ErrorKind::NotFound => (),
-            _ => panic!("remove_file() error: {e}"),
-        },
+
+    // Create pipe
+    match tokio::fs::metadata(&pipe_path).await {
+        Ok(metadata) => {
+            // Remove path if it is not a pipe
+            if !metadata.file_type().is_fifo() {
+                match std::fs::remove_file(&pipe_path) {
+                    Ok(()) => (),
+                    Err(err) => match err.kind() {
+                        std::io::ErrorKind::NotFound => (),
+                        _ => panic!("remove_file() error: {err}"),
+                    },
+                }
+                unix_named_pipe::create(&pipe_path, None)?;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            unix_named_pipe::create(&pipe_path, None)?;
+        }
+        Err(err) => panic!("{err}"),
     }
-    unix_named_pipe::create(&pipe_path, None)?;
+
     let _tmp_reader = unix_named_pipe::open_read(&pipe_path)?;
     let _tmp_writer = unix_named_pipe::open_write(&pipe_path)?;
 
