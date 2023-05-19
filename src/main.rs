@@ -1,13 +1,10 @@
 /// Server program that abstracts sway workspaces into layers of 2D grids and navigates through them
-
 use serde_json::Value;
 use std::os::unix::fs::FileTypeExt;
 use std::process::Stdio;
-use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio_stream::wrappers::LinesStream;
 use tokio_stream::StreamExt;
 
@@ -32,12 +29,12 @@ mod workspace {
     use crate::layer;
     use serde::Deserialize;
 
-    #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub(crate) struct Id(pub u32);
 
     simple_display_and_debug!(Id);
 
-    #[derive(Clone, Copy, Deserialize)]
+    #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Hash)]
     pub(crate) struct Num(pub i32);
 
     simple_display_and_debug!(Num);
@@ -85,21 +82,6 @@ mod workspace {
         pub row: u32,
         pub col: u32,
     }
-
-    #[derive(Debug)]
-    pub(crate) struct Workspace {
-        pub num: Num,
-        pub name: String,
-    }
-
-    impl From<crate::swaymsg::get_workspaces::Workspace> for Workspace {
-        fn from(workspace: crate::swaymsg::get_workspaces::Workspace) -> Self {
-            Self {
-                num: workspace.num,
-                name: workspace.name,
-            }
-        }
-    }
 }
 
 mod layer {
@@ -124,62 +106,11 @@ mod layer {
             workspace::Num((self.0 * 100 + coordinates.row * 10 + coordinates.col) as i32)
         }
     }
-
-    #[derive(Debug)]
-    pub(crate) struct Layer {
-        pub workspaces_num: usize,
-        // During transition from an empty workspace to a new layer, we need history of
-        // 3 workspaces to retain information about the last focused nonempty workspace.
-        // Invariant: first element is Some(_); before Some(_) there is no None.
-        pub last_focused_3_workspaces: Vec<workspace::Id>,
-    }
 }
 
 mod swaymsg {
     use crate::workspace;
     use tokio::process::Command;
-
-    pub(crate) mod subscribe {
-        pub(crate) mod workspace {
-            use crate::workspace;
-            use serde::Deserialize;
-
-            #[derive(Deserialize, Debug)]
-            pub(crate) struct Workspace {
-                pub id: workspace::Id,
-                pub num: workspace::Num,
-                pub name: String,
-            }
-
-            pub(crate) mod events {
-                use super::Workspace;
-                use serde::Deserialize;
-
-                #[derive(Deserialize, Debug)]
-                pub(crate) struct Init {
-                    pub current: Workspace,
-                }
-
-                #[derive(Deserialize, Debug)]
-                pub(crate) struct Empty {
-                    pub current: Workspace,
-                }
-
-                #[derive(Deserialize, Debug)]
-                pub(crate) struct Focus {
-                    pub current: Workspace,
-                }
-
-                #[derive(Deserialize, Debug)]
-                pub(crate) struct Rename {
-                    pub current: Workspace,
-                }
-
-                #[derive(Deserialize, Debug)]
-                pub(crate) struct Reload {}
-            }
-        }
-    }
 
     pub(crate) mod get_workspaces {
         use crate::workspace;
@@ -192,6 +123,7 @@ mod swaymsg {
             pub name: String,
             pub focused: bool,
             pub visible: bool,
+            pub output: String,
         }
     }
 
@@ -211,6 +143,16 @@ mod swaymsg {
         tracing::info!("Renaming workspace {old_name:?} to {new_name:?}");
         let status = Command::new("swaymsg")
             .args(["rename", "workspace", old_name, "to", new_name])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
+
+    pub(crate) async fn move_current_workspace_to_output(output: &str) {
+        tracing::info!("Moving current workspace to output {output:?}");
+        let status = Command::new("swaymsg")
+            .args(["move", "workspace", "to", "output", output])
             .status()
             .await
             .unwrap();
@@ -242,351 +184,6 @@ mod swaymsg {
             .await
             .unwrap();
         assert!(status.success());
-    }
-}
-
-mod state {
-    use crate::{
-        layer::{self, Layer},
-        swaymsg, workspace,
-    };
-    use std::collections::{BTreeMap, HashMap};
-
-    pub(crate) struct State {
-        workspaces: HashMap<workspace::Id, workspace::Workspace>,
-        layers: BTreeMap<layer::Id, Layer>,
-        focused: Option<workspace::Id>,
-        last_layer_id: layer::Id,
-    }
-
-    mod from_impl {
-        use crate::workspace;
-
-        #[derive(Debug)]
-        pub(super) struct Layer {
-            pub workspaces_num: usize,
-            pub visible_workspace_id: Option<workspace::Id>,
-            pub any_unvisible_workspace_id: Option<workspace::Id>,
-        }
-    }
-
-    impl State {
-        async fn create_workspace(
-            &mut self,
-            mut workspace: swaymsg::subscribe::workspace::Workspace,
-        ) {
-            let layer_id = match workspace.num.to_layer_id() {
-                Some(layer_id) => layer_id,
-                None => {
-                    self.last_layer_id.0 += 1;
-                    workspace.num = self
-                        .last_layer_id
-                        .to_workspace_num(workspace::Coordinates { row: 0, col: 0 });
-                    let old_name = std::mem::replace(&mut workspace.name, workspace.num.to_name());
-                    swaymsg::rename_workspace(&old_name, &workspace.name).await;
-                    self.last_layer_id
-                }
-            };
-            self.last_layer_id = self.last_layer_id.max(layer_id);
-            self.layers
-                .entry(layer_id)
-                .and_modify(|layer| {
-                    layer.workspaces_num += 1;
-                })
-                .or_insert_with(|| {
-                    tracing::info!("Creating layer {layer_id}");
-
-                    let mut last_focused_3_workspaces = Vec::with_capacity(3);
-                    last_focused_3_workspaces.push(workspace.id);
-                    tracing::trace!("last_focused_3_workspaces: [{}]", workspace.num);
-
-                    Layer {
-                        workspaces_num: 1,
-                        last_focused_3_workspaces,
-                    }
-                });
-            tracing::info!(
-                "Creating workspace number {} (name: {})",
-                workspace.num,
-                workspace.name
-            );
-            self.workspaces
-                .entry(workspace.id)
-                .or_insert(workspace::Workspace {
-                    num: workspace.num,
-                    name: workspace.name,
-                });
-        }
-
-        pub(crate) async fn from(
-            got_workspaces: Vec<crate::swaymsg::get_workspaces::Workspace>,
-        ) -> Self {
-            let mut last_layer_id = got_workspaces
-                .iter()
-                .filter_map(|workspace| workspace.num.to_layer_id())
-                .fold(layer::Id(0), std::cmp::max);
-
-            for workspace in &got_workspaces {
-                tracing::info!(
-                    "Found workspace {} (name: {})",
-                    workspace.num,
-                    workspace.name
-                );
-            }
-            tracing::trace!("last_layer_id: {last_layer_id}");
-
-            let mut workspaces = HashMap::new();
-            let mut layers = HashMap::new();
-            let mut focused = None;
-            for mut workspace in got_workspaces {
-                let layer_id = match workspace.num.to_layer_id() {
-                    Some(layer_id) => layer_id,
-                    None => {
-                        last_layer_id.0 += 1;
-                        workspace.num = last_layer_id
-                            .to_workspace_num(workspace::Coordinates { row: 0, col: 0 });
-                        tracing::trace!("new workspace.num = {}", workspace.num);
-                        let old_name =
-                            std::mem::replace(&mut workspace.name, workspace.num.to_name());
-                        swaymsg::rename_workspace(&old_name, &workspace.name).await;
-                        last_layer_id
-                    }
-                };
-
-                let layer = layers.entry(layer_id).or_insert_with(|| from_impl::Layer {
-                    workspaces_num: 0,
-                    visible_workspace_id: workspace.visible.then_some(workspace.id),
-                    any_unvisible_workspace_id: (!workspace.visible).then_some(workspace.id),
-                });
-                layer.workspaces_num += 1;
-
-                if workspace.visible {
-                    layer.visible_workspace_id = Some(workspace.id);
-
-                    if workspace.focused {
-                        assert!(focused.is_none());
-                        focused = Some(workspace.id);
-                    }
-                }
-
-                workspaces.insert(workspace.id, workspace::Workspace::from(workspace));
-            }
-
-            if let Some(workspace_id) = focused {
-                let workspace = workspaces.get(&workspace_id).unwrap();
-                tracing::info!(
-                    "Focused workspace {} (name: {})",
-                    workspace.num,
-                    workspace.name
-                );
-            }
-
-            let layers = layers
-                .into_iter()
-                .map(|(layer_id, layer)| {
-                    (
-                        layer_id,
-                        Layer {
-                            workspaces_num: layer.workspaces_num,
-                            last_focused_3_workspaces: {
-                                let mut last_focused_3_workspaces = Vec::with_capacity(3);
-                                last_focused_3_workspaces.extend(
-                                    #[allow(clippy::filter_map_identity)]
-                                    [layer.visible_workspace_id, layer.any_unvisible_workspace_id]
-                                        .into_iter()
-                                        .filter_map(|x| x),
-                                );
-                                assert!(!last_focused_3_workspaces.is_empty());
-                                tracing::trace!(
-                                    "Layer {layer_id}: last_focused_3_workspaces: {:?}",
-                                    last_focused_3_workspaces
-                                        .iter()
-                                        .map(|workspace_id| workspaces
-                                            .get(workspace_id)
-                                            .unwrap()
-                                            .num)
-                                        .collect::<Vec<_>>()
-                                );
-                                last_focused_3_workspaces
-                            },
-                        },
-                    )
-                })
-                .collect();
-
-            Self {
-                workspaces,
-                layers,
-                focused,
-                last_layer_id,
-            }
-        }
-
-        pub(crate) async fn handle_event(&mut self, event: Event) {
-            use Event::*;
-            match event {
-                Create(workspace) => {
-                    self.create_workspace(workspace).await;
-                }
-                Delete(workspace_id) => {
-                    let workspace = self.workspaces.remove(&workspace_id).unwrap();
-                    tracing::info!(
-                        "Removed workspace {} (name: {})",
-                        workspace.num,
-                        workspace.name
-                    );
-                    let layer_id = workspace.num.to_layer_id().unwrap();
-                    let layer = self.layers.get_mut(&layer_id).unwrap();
-                    layer
-                        .last_focused_3_workspaces
-                        .retain(|wid| wid != &workspace_id);
-                    layer.workspaces_num -= 1;
-                    if layer.workspaces_num == 0 {
-                        tracing::info!("Removing layer {layer_id}");
-                        self.layers.remove(&layer_id).unwrap();
-                    } else {
-                        tracing::trace!(
-                            "Layer {layer_id}: last_focused_3_workspaces: {:?}",
-                            layer
-                                .last_focused_3_workspaces
-                                .iter()
-                                .map(|workspace_id| self.workspaces.get(workspace_id).unwrap().num)
-                                .collect::<Vec<_>>()
-                        );
-                    }
-                }
-                Focused(workspace_id) => {
-                    let workspace = self.workspaces.get(&workspace_id).unwrap();
-                    tracing::info!(
-                        "Focused workspace {} (name: {})",
-                        workspace.num,
-                        workspace.name
-                    );
-                    let layer_id = workspace.num.to_layer_id().unwrap();
-                    let last_focused_3_workspaces = &mut self
-                        .layers
-                        .get_mut(&layer_id)
-                        .unwrap()
-                        .last_focused_3_workspaces;
-                    last_focused_3_workspaces.retain(|wid| wid != &workspace_id);
-                    if last_focused_3_workspaces.len() > 2 {
-                        last_focused_3_workspaces.pop();
-                    }
-                    last_focused_3_workspaces.insert(0, workspace_id);
-
-                    tracing::trace!(
-                        "Layer {layer_id}: last_focused_3_workspaces: {:?}",
-                        last_focused_3_workspaces
-                            .iter()
-                            .map(|workspace_id| self.workspaces.get(workspace_id).unwrap().num)
-                            .collect::<Vec<_>>()
-                    );
-
-                    self.focused = Some(workspace_id);
-                }
-                Rename {
-                    id,
-                    new_num,
-                    new_name,
-                } => {
-                    let workspace = self.workspaces.get_mut(&id).unwrap();
-                    tracing::info!(
-                        "Renamed workspace {} -> {new_num} (name: {} -> {new_name})",
-                        workspace.num,
-                        workspace.name,
-                    );
-                    workspace.num = new_num;
-                    workspace.name = new_name;
-                }
-            }
-        }
-
-        async fn impl_switch_carry_workspace(&mut self, carry: bool, kind: SwitchKind) {
-            let old_workspace = {
-                let Some(workspace_id) = self.focused else {
-                    return tracing::error!("Cannot switch workspace if none is focused");
-                };
-                self.workspaces.get(&workspace_id).unwrap()
-            };
-            let old_layer_id = old_workspace.num.to_layer_id().unwrap();
-            let old_coordinates = old_workspace.num.to_coordinates().unwrap();
-
-            use SwitchKind::*;
-            let workspace_num = match kind {
-                Right => old_layer_id.to_workspace_num(workspace::Coordinates {
-                    col: (old_coordinates.col + 1) % layer::COLUMNS,
-                    ..old_coordinates
-                }),
-                Left => old_layer_id.to_workspace_num(workspace::Coordinates {
-                    col: (old_coordinates.col + layer::COLUMNS - 1) % layer::COLUMNS,
-                    ..old_coordinates
-                }),
-                Down => old_layer_id.to_workspace_num(workspace::Coordinates {
-                    row: (old_coordinates.row + 1) % layer::ROWS,
-                    ..old_coordinates
-                }),
-                Up => old_layer_id.to_workspace_num(workspace::Coordinates {
-                    row: (old_coordinates.row + layer::ROWS - 1) % layer::ROWS,
-                    ..old_coordinates
-                }),
-                NextLayer => {
-                    self.workspaces
-                        .get(
-                            &self
-                                .layers
-                                .range((
-                                    std::ops::Bound::Excluded(old_layer_id),
-                                    std::ops::Bound::Unbounded,
-                                ))
-                                .next()
-                                .or_else(|| self.layers.first_key_value())
-                                .unwrap()
-                                .1
-                                .last_focused_3_workspaces[0],
-                        )
-                        .unwrap()
-                        .num
-                }
-                NewLayer => layer::Id(self.last_layer_id.0 + 1)
-                    .to_workspace_num(workspace::Coordinates { row: 0, col: 0 }),
-            };
-            if carry {
-                swaymsg::move_window_to_workspace(workspace_num).await;
-            }
-            // self.focused = Some(workspace_num);
-            swaymsg::switch_to_workspace(workspace_num).await;
-        }
-
-        pub(crate) async fn switch_workspace(&mut self, kind: SwitchKind) {
-            tracing::info!("Command: switch workspace to {:?}", kind);
-            self.impl_switch_carry_workspace(false, kind).await
-        }
-
-        pub(crate) async fn carry_to_workspace(&mut self, kind: SwitchKind) {
-            tracing::info!("Command: carry and switch to workspace {:?}", kind);
-            self.impl_switch_carry_workspace(true, kind).await
-        }
-    }
-
-    pub(crate) enum Event {
-        Create(swaymsg::subscribe::workspace::Workspace),
-        Delete(workspace::Id),
-        Focused(workspace::Id),
-        Rename {
-            id: workspace::Id,
-            new_num: workspace::Num,
-            new_name: String,
-        },
-    }
-
-    #[derive(Debug)]
-    pub(crate) enum SwitchKind {
-        Right,
-        Left,
-        Up,
-        Down,
-        NextLayer,
-        NewLayer,
     }
 }
 
@@ -631,77 +228,6 @@ async fn create_command_pipe() -> std::io::Result<(tokio::fs::File, tokio::fs::F
     Ok((reader, writer))
 }
 
-async fn handle_sway_events<T: tokio_stream::Stream<Item = Value> + Unpin>(
-    state_mutex: Arc<Mutex<state::State>>,
-    mut json_event_stream: T,
-) {
-    loop {
-        let value = json_event_stream.next().await.unwrap();
-        let event = value.as_object().unwrap()["change"].as_str().unwrap();
-        tracing::trace!("Event: {event}");
-        let mut state = state_mutex.lock().await;
-        use state::Event::*;
-        use swaymsg::subscribe::workspace::events::*;
-        match event {
-            "init" => {
-                let init: Init = serde_json::from_value(value).unwrap();
-                state.handle_event(Create(init.current)).await;
-            }
-            "empty" => {
-                let empty: Empty = serde_json::from_value(value).unwrap();
-                state.handle_event(Delete(empty.current.id)).await;
-            }
-            "focus" => {
-                let focus: Focus = serde_json::from_value(value).unwrap();
-                state.handle_event(Focused(focus.current.id)).await;
-            }
-            "move" => {}
-            "rename" => {
-                let rename: swaymsg::subscribe::workspace::events::Rename =
-                    serde_json::from_value(value).unwrap();
-                state
-                    .handle_event(state::Event::Rename {
-                        id: rename.current.id,
-                        new_num: rename.current.num,
-                        new_name: rename.current.name,
-                    })
-                    .await;
-            }
-            "urgent" => {}
-            "reload" => {}
-            unknown => {
-                panic!("Unknown event: {unknown}");
-            }
-        }
-    }
-}
-
-async fn handle_commands<T: tokio_stream::Stream<Item = String> + Unpin>(
-    state_mutex: Arc<Mutex<state::State>>,
-    mut command_stream: T,
-) {
-    loop {
-        let command = command_stream.next().await.unwrap();
-        let mut state = state_mutex.lock().await;
-        use state::SwitchKind::*;
-        match command.as_str() {
-            "go right" => state.switch_workspace(Right).await,
-            "go left" => state.switch_workspace(Left).await,
-            "go up" => state.switch_workspace(Up).await,
-            "go down" => state.switch_workspace(Down).await,
-            "go to next layer" => state.switch_workspace(NextLayer).await,
-            "go to new layer" => state.switch_workspace(NewLayer).await,
-            "carry right" => state.carry_to_workspace(Right).await,
-            "carry left" => state.carry_to_workspace(Left).await,
-            "carry up" => state.carry_to_workspace(Up).await,
-            "carry down" => state.carry_to_workspace(Down).await,
-            "carry to next layer" => state.carry_to_workspace(NextLayer).await,
-            "carry to new layer" => state.carry_to_workspace(NewLayer).await,
-            _ => tracing::error!("Unknown command: {command}"),
-        }
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt()
@@ -718,16 +244,384 @@ async fn main() {
         .spawn()
         .unwrap();
 
-    let workspaces = swaymsg::get_workspaces().await;
-    let state_mutex = Arc::new(Mutex::new(state::State::from(workspaces).await));
-
-    let json_event_stream =
+    let mut json_event_stream =
         LinesStream::new(BufReader::new(swaymsg_process.stdout.take().unwrap()).lines())
             .map(|line| -> Value { serde_json::from_str(&line.unwrap()).unwrap() });
 
-    let command_stream =
+    let mut command_stream =
         LinesStream::new(BufReader::new(command_pipe).lines()).map(|line| line.unwrap());
 
-    tokio::spawn(handle_sway_events(state_mutex.clone(), json_event_stream));
-    handle_commands(state_mutex, command_stream).await;
+    let mut persistent_state = persistent_state::State::new();
+    {
+        let mut state = current_state::State::new(&persistent_state).await;
+        tracing::trace!("Initial state: {state:#?}");
+        state.repair().await;
+        persistent_state.update(&state);
+    }
+    loop {
+        tokio::select! {
+            event = json_event_stream.next() => {
+                handle_sway_event(event.unwrap(), &mut persistent_state).await;
+            }
+            command = command_stream.next() => {
+                handle_command(command.unwrap(), &mut persistent_state).await;
+            }
+        }
+    }
+}
+
+async fn handle_sway_event(
+    _event: serde_json::Value,
+    persistent_state: &mut persistent_state::State,
+) {
+    let mut state = current_state::State::new(persistent_state).await;
+    state.repair().await;
+    persistent_state.update(&state);
+}
+
+async fn handle_command(command: String, persistent_state: &mut persistent_state::State) {
+    let mut state = current_state::State::new(persistent_state).await;
+    state.repair().await;
+
+    use SwitchKind::*;
+    match command.as_str() {
+        "go right" => state.switch_to_workspace(Right).await,
+        "go left" => state.switch_to_workspace(Left).await,
+        "go up" => state.switch_to_workspace(Up).await,
+        "go down" => state.switch_to_workspace(Down).await,
+        "go to next layer" => state.switch_to_workspace(NextLayer).await,
+        "go to new layer" => state.switch_to_workspace(NewLayer).await,
+        "carry right" => state.carry_to_workspace(Right).await,
+        "carry left" => state.carry_to_workspace(Left).await,
+        "carry up" => state.carry_to_workspace(Up).await,
+        "carry down" => state.carry_to_workspace(Down).await,
+        "carry to next layer" => state.carry_to_workspace(NextLayer).await,
+        "carry to new layer" => state.carry_to_workspace(NewLayer).await,
+        _ => tracing::error!("Unknown command: {command}"),
+    }
+
+    persistent_state.update(&state);
+}
+
+#[derive(Debug)]
+pub(crate) enum SwitchKind {
+    Right,
+    Left,
+    Up,
+    Down,
+    NextLayer,
+    NewLayer,
+}
+
+mod persistent_state {
+    use crate::{current_state, layer, workspace};
+    use std::collections::HashMap;
+
+    #[derive(Debug)]
+    pub(crate) struct Layer {
+        pub last_focused_workspace_num: workspace::Num,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct State {
+        pub layers: HashMap<layer::Id, Layer>,
+        pub next_layer_id: layer::Id,
+    }
+
+    impl State {
+        pub(crate) fn new() -> Self {
+            Self {
+                layers: HashMap::new(),
+                next_layer_id: layer::Id(1),
+            }
+        }
+
+        pub(crate) fn update(&mut self, current_state: &current_state::State) {
+            tracing::trace!("Updating persistent state with the current state: {current_state:#?}");
+            self.next_layer_id = current_state.next_layer_id;
+            // Remove layers that disappeared
+            self.layers
+                .retain(|layer_id, _| current_state.layers.contains_key(layer_id));
+            // Update or add layers
+            for (layer_id, layer) in &current_state.layers {
+                self.layers.insert(
+                    layer_id.clone(),
+                    Layer {
+                        last_focused_workspace_num: layer.last_focused_workspace_num,
+                    },
+                );
+            }
+        }
+    }
+}
+
+mod current_state {
+    use crate::{layer, persistent_state, swaymsg, workspace, SwitchKind};
+    use std::{
+        cmp::max,
+        collections::{BTreeMap, HashMap, HashSet},
+        mem,
+    };
+
+    #[derive(Debug)]
+    pub(crate) struct State {
+        pub workspaces: BTreeMap<workspace::Id, Workspace>,
+        pub layers: BTreeMap<layer::Id, Layer>,
+        pub next_layer_id: layer::Id,
+        pub focused_workspace_id: Option<workspace::Id>,
+    }
+
+    impl State {
+        pub(crate) async fn new(persistent_state: &persistent_state::State) -> Self {
+            let span = tracing::trace_span!("Creating current state");
+            let _enter = span.enter();
+
+            let mut workspaces = BTreeMap::new();
+            let mut layers = BTreeMap::new();
+            let mut next_layer_id = persistent_state.next_layer_id;
+            let mut focused_workspace_id = None;
+            // let workspaces = swaymsg::get_workspaces().await;
+            for workspace in swaymsg::get_workspaces().await {
+                workspaces.insert(
+                    workspace.id,
+                    Workspace {
+                        num: workspace.num,
+                        name: workspace.name,
+                        focused: workspace.focused,
+                        visible: workspace.visible,
+                        output: workspace.output,
+                    },
+                );
+
+                if let Some(layer_id) = workspace.num.to_layer_id() {
+                    layers
+                        .entry(layer_id)
+                        .and_modify(|layer: &mut Layer| {
+                            layer.workspaces_num += 1;
+                            if workspace.focused || workspace.visible {
+                                layer.last_focused_workspace_num = workspace.num;
+                            }
+                        })
+                        .or_insert_with(|| {
+                            tracing::trace!("New layer: {layer_id}");
+                            Layer {
+                                workspaces_num: 1,
+                                last_focused_workspace_num: if workspace.focused
+                                    || workspace.visible
+                                {
+                                    workspace.num
+                                } else {
+                                    if let Some(layer) = persistent_state.layers.get(&layer_id) {
+                                        layer.last_focused_workspace_num
+                                    } else {
+                                        workspace.num
+                                    }
+                                },
+                            }
+                        });
+
+                    next_layer_id = max(next_layer_id, layer::Id(layer_id.0 + 1));
+                }
+
+                if workspace.focused {
+                    focused_workspace_id = Some(workspace.id);
+                }
+            }
+            tracing::trace!("Focused workspace id: {:?}", focused_workspace_id);
+
+            Self {
+                workspaces,
+                layers,
+                next_layer_id,
+                focused_workspace_id,
+            }
+        }
+
+        pub(crate) async fn repair(&mut self) {
+            macro_rules! move_workspace_to_a_new_layer {
+                ($workspace:ident) => {
+                    let new_num = self
+                        .next_layer_id
+                        .to_workspace_num(workspace::Coordinates { row: 0, col: 0 });
+                    Self::rename_workspace_impl(
+                        $workspace,
+                        new_num,
+                        &mut self.layers,
+                        &mut self.next_layer_id,
+                    )
+                    .await;
+                };
+            }
+            // First fix names of the workspaces with assigned layer
+            let mut taken_numbers = HashSet::new();
+            for workspace in self.workspaces.values() {
+                if workspace.num.to_layer_id().is_some()
+                    && workspace.name == workspace.num.to_name()
+                {
+                    taken_numbers.insert(workspace.num);
+                }
+            }
+            for workspace in self.workspaces.values_mut() {
+                if workspace.num.to_layer_id().is_some()
+                    && workspace.name != workspace.num.to_name()
+                {
+                    if taken_numbers.contains(&workspace.num) {
+                        move_workspace_to_a_new_layer!(workspace);
+                    } else {
+                        Self::rename_workspace_impl(
+                            workspace,
+                            workspace.num,
+                            &mut self.layers,
+                            &mut self.next_layer_id,
+                        )
+                        .await;
+                    }
+                    taken_numbers.insert(workspace.num);
+                }
+            }
+            // Assign number to the workspaces without assigned layer
+            for workspace in self.workspaces.values_mut() {
+                if let None = workspace.num.to_layer_id() {
+                    move_workspace_to_a_new_layer!(workspace);
+                }
+            }
+            // Fix outputs (every layer has to be on exactly one output)
+            let focused_workspace_id_to_restore = self.focused_workspace_id;
+            let mut layer_to_output = HashMap::new();
+            for (workspace_id, workspace) in &mut self.workspaces {
+                let layer_output = layer_to_output
+                    .entry(workspace.num.to_layer_id().unwrap())
+                    .or_insert_with(|| workspace.output.clone());
+                if *layer_output != workspace.output {
+                    if Some(*workspace_id) != self.focused_workspace_id {
+                        swaymsg::switch_to_workspace(workspace.num).await;
+                        self.focused_workspace_id = Some(*workspace_id);
+                    }
+                    swaymsg::move_current_workspace_to_output(&layer_output).await;
+                }
+            }
+            if self.focused_workspace_id != focused_workspace_id_to_restore {
+                swaymsg::switch_to_workspace(
+                    self.workspaces
+                        .get(&focused_workspace_id_to_restore.unwrap())
+                        .unwrap()
+                        .num,
+                )
+                .await;
+                self.focused_workspace_id = focused_workspace_id_to_restore;
+            }
+        }
+
+        async fn rename_workspace_impl(
+            workspace: &mut Workspace,
+            new_num: workspace::Num,
+            layers: &mut BTreeMap<layer::Id, Layer>,
+            next_layer_id: &mut layer::Id,
+        ) {
+            let layer_id = new_num.to_layer_id().unwrap();
+            let old_num = mem::replace(&mut workspace.num, new_num);
+            let old_name = mem::replace(&mut workspace.name, new_num.to_name());
+            swaymsg::rename_workspace(&old_name, &workspace.name).await;
+            // Update the target layer
+            layers
+                .entry(layer_id)
+                .and_modify(|layer| {
+                    layer.workspaces_num += 1;
+                    if workspace.focused || workspace.visible {
+                        layer.last_focused_workspace_num = workspace.num;
+                    }
+                })
+                .or_insert_with(|| {
+                    *next_layer_id = max(*next_layer_id, layer::Id(layer_id.0 + 1));
+                    Layer {
+                        workspaces_num: 1,
+                        last_focused_workspace_num: workspace.num,
+                    }
+                });
+            // Update the source layer
+            if let Some(old_layer_id) = old_num.to_layer_id() {
+                let workspaces_num = &mut layers.get_mut(&old_layer_id).unwrap().workspaces_num;
+                *workspaces_num -= 1;
+                if *workspaces_num == 0 {
+                    layers.remove(&old_layer_id);
+                }
+            }
+        }
+
+        async fn impl_switch_to_workspace(&mut self, kind: SwitchKind, carry_focused_window: bool) {
+            if let None = self.focused_workspace_id {
+                return tracing::error!("Cannot switch workspace if no workspace is focused");
+            }
+            let old_workspace = self
+                .workspaces
+                .get(&self.focused_workspace_id.unwrap())
+                .unwrap();
+            let old_layer_id = old_workspace.num.to_layer_id().unwrap();
+            let old_coordinates = old_workspace.num.to_coordinates().unwrap();
+
+            use SwitchKind::*;
+            let workspace_num = match kind {
+                Right => old_layer_id.to_workspace_num(workspace::Coordinates {
+                    col: (old_coordinates.col + 1) % layer::COLUMNS,
+                    ..old_coordinates
+                }),
+                Left => old_layer_id.to_workspace_num(workspace::Coordinates {
+                    col: (old_coordinates.col + layer::COLUMNS - 1) % layer::COLUMNS,
+                    ..old_coordinates
+                }),
+                Down => old_layer_id.to_workspace_num(workspace::Coordinates {
+                    row: (old_coordinates.row + 1) % layer::ROWS,
+                    ..old_coordinates
+                }),
+                Up => old_layer_id.to_workspace_num(workspace::Coordinates {
+                    row: (old_coordinates.row + layer::ROWS - 1) % layer::ROWS,
+                    ..old_coordinates
+                }),
+                NextLayer => {
+                    self.layers
+                        .range((
+                            std::ops::Bound::Excluded(old_layer_id),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .or_else(|| self.layers.first_key_value())
+                        .unwrap()
+                        .1
+                        .last_focused_workspace_num
+                }
+                NewLayer => {
+                    let new_layer_id = self.next_layer_id;
+                    self.next_layer_id.0 += 1;
+                    new_layer_id.to_workspace_num(workspace::Coordinates { row: 0, col: 0 })
+                }
+            };
+            if carry_focused_window {
+                swaymsg::move_window_to_workspace(workspace_num).await;
+            }
+            swaymsg::switch_to_workspace(workspace_num).await;
+        }
+
+        pub(crate) async fn switch_to_workspace(&mut self, kind: SwitchKind) {
+            self.impl_switch_to_workspace(kind, false).await;
+        }
+
+        pub(crate) async fn carry_to_workspace(&mut self, kind: SwitchKind) {
+            self.impl_switch_to_workspace(kind, true).await;
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct Layer {
+        pub workspaces_num: u32,
+        pub last_focused_workspace_num: workspace::Num,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct Workspace {
+        pub num: workspace::Num,
+        pub name: String,
+        pub focused: bool,
+        pub visible: bool,
+        pub output: String,
+    }
 }
