@@ -232,6 +232,7 @@ async fn create_command_pipe() -> std::io::Result<(tokio::fs::File, tokio::fs::F
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(atty::is(atty::Stream::Stdout))
         .init();
 
     // Holding pipe writer open prevents reading EOF if an external pipe writer closes file descriptor
