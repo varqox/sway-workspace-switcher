@@ -1,5 +1,6 @@
 /// Server program that abstracts sway workspaces into layers of 2D grids and navigates through them
 use serde_json::Value;
+use std::io::IsTerminal;
 use std::os::unix::fs::FileTypeExt;
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
@@ -230,7 +231,7 @@ async fn create_command_pipe() -> std::io::Result<(tokio::fs::File, tokio::fs::F
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_ansi(atty::is(atty::Stream::Stdout))
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     // Holding pipe writer open prevents reading EOF if an external pipe writer closes file descriptor
