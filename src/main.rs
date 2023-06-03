@@ -161,17 +161,16 @@ mod swaymsg {
 
     pub(crate) async fn switch_to_workspace(num: workspace::Num) {
         tracing::info!("Switch to workspace with number {num}");
-        let status = Command::new("swaymsg")
+        Command::new("swaymsg")
             .args(["workspace", "number", &num.to_name()])
             .status()
             .await
             .unwrap();
-        assert!(status.success());
     }
 
     pub(crate) async fn move_window_to_workspace(num: workspace::Num) {
         tracing::info!("Move focused window to workspace with number {num}");
-        let status = Command::new("swaymsg")
+        Command::new("swaymsg")
             .args([
                 "move",
                 "window",
@@ -183,7 +182,6 @@ mod swaymsg {
             .status()
             .await
             .unwrap();
-        assert!(status.success());
     }
 }
 
