@@ -6,8 +6,8 @@ use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
-use tokio_stream::wrappers::LinesStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::LinesStream;
 
 macro_rules! simple_display_and_debug {
     ($newtype:ident) => {
@@ -356,7 +356,7 @@ mod persistent_state {
 }
 
 mod current_state {
-    use crate::{layer, persistent_state, swaymsg, workspace, SwitchKind};
+    use crate::{SwitchKind, layer, persistent_state, swaymsg, workspace};
     use std::{
         cmp::max,
         collections::{BTreeMap, HashMap, HashSet},
