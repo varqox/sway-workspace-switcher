@@ -345,7 +345,7 @@ mod persistent_state {
             // Update or add layers
             for (layer_id, layer) in &current_state.layers {
                 self.layers.insert(
-                    layer_id.clone(),
+                    *layer_id,
                     Layer {
                         last_focused_workspace_num: layer.last_focused_workspace_num,
                     },
@@ -410,12 +410,10 @@ mod current_state {
                                     || workspace.visible
                                 {
                                     workspace.num
-                                } else {
-                                    if let Some(layer) = persistent_state.layers.get(&layer_id) {
+                                } else if let Some(layer) = persistent_state.layers.get(&layer_id) {
                                         layer.last_focused_workspace_num
                                     } else {
                                         workspace.num
-                                    }
                                 },
                             }
                         });
@@ -481,7 +479,7 @@ mod current_state {
             }
             // Assign number to the workspaces without assigned layer
             for workspace in self.workspaces.values_mut() {
-                if let None = workspace.num.to_layer_id() {
+                if workspace.num.to_layer_id().is_none() {
                     move_workspace_to_a_new_layer!(workspace);
                 }
             }
@@ -497,7 +495,7 @@ mod current_state {
                         swaymsg::switch_to_workspace(workspace.num).await;
                         self.focused_workspace_id = Some(*workspace_id);
                     }
-                    swaymsg::move_current_workspace_to_output(&layer_output).await;
+                    swaymsg::move_current_workspace_to_output(layer_output).await;
                 }
             }
             if self.focused_workspace_id != focused_workspace_id_to_restore {
@@ -549,7 +547,7 @@ mod current_state {
         }
 
         async fn impl_switch_to_workspace(&mut self, kind: SwitchKind, carry_focused_window: bool) {
-            if let None = self.focused_workspace_id {
+            if self.focused_workspace_id.is_none() {
                 return tracing::error!("Cannot switch workspace if no workspace is focused");
             }
             let old_workspace = self
